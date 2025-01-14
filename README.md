@@ -1,1 +1,3 @@
-# CloudFlareDNSClient
+# DuckDNSClient
+
+DuckDNS IP Auto Update 
