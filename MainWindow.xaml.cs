@@ -251,7 +251,7 @@ namespace DuckDNSClient
         private void InitTrayIcon()
         {
             m_notifyIcon = new System.Windows.Forms.NotifyIcon();
-            m_notifyIcon.Text = "CFD";
+            m_notifyIcon.Text = "DuckDNSClient";
             m_notifyIcon.Icon = Properties.Resources.godaddy;
             m_notifyIcon.MouseDoubleClick += mNotifyIcon_MouseDoubleClick;
             m_notifyIcon.MouseClick += mNotifyIcon_MouseClick;
