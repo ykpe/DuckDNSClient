@@ -8,6 +8,17 @@ using System.Timers;
 using System.Windows;
 using System.Windows.Controls;
 
+using System;
+using System.ComponentModel;
+using System.IO;
+using System.Net.Http;
+using System.Text;
+using System.Text.Json; // 需引用 System.Text.Json
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Controls;
+using System.Timers;
+
 namespace DuckDNSClient
 {
     /// <summary>
@@ -15,43 +26,53 @@ namespace DuckDNSClient
     /// </summary>
     public partial class MainWindow : Window
     {
-        private DNSData duckDNSData;
-        private string Now = "";
-        private string ipInfoURL = "https://api.ipify.org";
-        private string ip6InfoURL = "https://api64.ipify.org";
-        private string recordIPv4 = "127.0.0.1";
-        private string recordIPv6 = "[::1]";
-        private string MODE_IPV4 = "4";
-        private string MODE_IPV6 = "6";
+        // 使用靜態 HttpClient 以避免 Socket 耗盡
+        private static readonly HttpClient _httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
 
-        private string recordFileName = "tick.tmp";
-        //private bool CloseAllowed;
-        private Timer Timer_updateDNS;
-        private System.Windows.Forms.NotifyIcon m_notifyIcon;
-        private System.Windows.Controls.ContextMenu mContextMenu;
+        private DNSData _duckDNSData;
+        private const string IpInfoUrl = "https://api.ipify.org";
+        private const string Ip6InfoUrl = "https://api64.ipify.org";
+        private const string ConfigFileName = "settings.json";
+
+        private string _currentIPv4 = "";
+        private string _currentIPv6 = "";
+
+        private Timer _updateTimer;
+        private System.Windows.Forms.NotifyIcon _notifyIcon;
+        private ContextMenu _contextMenu;
+
         public MainWindow()
         {
             InitializeComponent();
-            duckDNSData = new DNSData();
+            _duckDNSData = new DNSData();
 
-            Timer_updateDNS = new System.Timers.Timer();
-            Timer_updateDNS.Interval = 5000;
-            Timer_updateDNS.AutoReset = true;
-            Timer_updateDNS.Enabled = true;
-            Timer_updateDNS.Stop();
-            Timer_updateDNS.Elapsed += OnTimedEvent_UpdateDomain;
-            StopTimer();
+            InitTimer();
             InitTrayIcon();
             LoadRecord();
             CheckAutoStart();
         }
 
+        private void InitTimer()
+        {
+            _updateTimer = new Timer();
+            _updateTimer.AutoReset = true;
+            _updateTimer.Elapsed += OnTimedEvent_UpdateDomain;
+        }
 
         private void StartTimer()
         {
-            Timer_updateDNS.Stop();
-            Timer_updateDNS.Interval = Int32.Parse(duckDNSData.updateInterval) * 60000;
-            Timer_updateDNS.Start();
+            _updateTimer.Stop();
+            // 嘗試解析間隔，預設 5 分鐘
+            if (int.TryParse(_duckDNSData.UpdateInterval, out int interval))
+            {
+                _updateTimer.Interval = Math.Max(1, interval) * 60000; // 至少 1 分鐘
+            }
+            else
+            {
+                _updateTimer.Interval = 300000;
+            }
+
+            _updateTimer.Start();
 
             Button_UpdateStart.IsEnabled = false;
             Button_UpdateStop.IsEnabled = true;
@@ -59,48 +80,33 @@ namespace DuckDNSClient
 
         private void StopTimer()
         {
-            Timer_updateDNS.Stop();
+            _updateTimer.Stop();
             Button_UpdateStart.IsEnabled = true;
             Button_UpdateStop.IsEnabled = false;
         }
 
-        private void OnTimedEvent_UpdateDomain(object source, System.Timers.ElapsedEventArgs e)
+        // Timer 事件是在 ThreadPool 執行，使用 async void 是被允許的 (Event Handler)
+        private async void OnTimedEvent_UpdateDomain(object source, ElapsedEventArgs e)
         {
-            UpdateDomain();
+            await UpdateDNSInfoAsync();
         }
 
-        private void UpdateDomain()
+        private async void Button_UpdateStart_Click(object sender, RoutedEventArgs e)
         {
-            Dispatcher.BeginInvoke((Action)(() =>
-            {
-                Task.Run(() => UpdateDNSInfoAsync());
-            }));
-        }
+            _duckDNSData.Token = TextBox_APIKey.Text;
+            _duckDNSData.DomainName = TextBox_ZoneID.Text;
+            _duckDNSData.UpdateInterval = TextBox_Interval.Text;
 
-        private void Button_UpdateStart_Click(object sender, RoutedEventArgs e)
-        {
-            if (TextBox_APIKey.Text.Length > 0)
-            {
-                duckDNSData.token = TextBox_APIKey.Text;
-            }
-
-            if (TextBox_ZoneID.Text.Length > 0)
-            {
-                duckDNSData.domainName = TextBox_ZoneID.Text;
-            }
-            if (TextBox_Interval.Text.Length > 0)
-            {
-                duckDNSData.updateInterval = TextBox_Interval.Text;
-            }
-
-            recordIPv4 = "";
-            recordIPv6 = "";
-
-            UpdateDomain();
-
-            StartTimer();
+            // 重置紀錄以強制更新
+            _currentIPv4 = "";
+            _currentIPv6 = "";
 
             SaveRecord();
+
+            // 立即執行一次
+            await UpdateDNSInfoAsync();
+
+            StartTimer();
         }
 
         private void Button_UpdateStop_Click(object sender, RoutedEventArgs e)
@@ -108,236 +114,221 @@ namespace DuckDNSClient
             StopTimer();
         }
 
-
-        private async void UpdateDNSInfoAsync()
+        private async Task UpdateDNSInfoAsync()
         {
             try
             {
-                bool isIPNotChanged = true;
-                Now = DateTime.Now.ToString();
-                Uri uriForIPInfoV4 = new Uri(ipInfoURL);
-                Uri uriForIPInfoV6 = new Uri(ip6InfoURL);
+                string nowStr = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+                bool needsUpdate = false;
+                string newIPv4 = "";
+                string newIPv6 = "";
 
-                HttpClient clientForIPInfo = new HttpClient();
-                HttpResponseMessage rspForIPInfo;
-                rspForIPInfo = await clientForIPInfo.GetAsync(uriForIPInfoV4);
-                rspForIPInfo.EnsureSuccessStatusCode();
-
-                var newIP = await rspForIPInfo.Content.ReadAsStringAsync();
-
-                if (newIP == recordIPv4)
+                // 1. 取得 IPv4
+                try
                 {
-
-                    UpdateStatsLabel(MODE_IPV4, "IP Not Changed");   
-                }
-                else
-                {
-                    recordIPv4 = newIP.ToString();
-
-                    UpdateStatsLabel(MODE_IPV4, recordIPv4);
-
-                    isIPNotChanged = false;
-                }
-
-
-                rspForIPInfo = await clientForIPInfo.GetAsync(uriForIPInfoV6);
-                rspForIPInfo.EnsureSuccessStatusCode();
-
-                newIP = await rspForIPInfo.Content.ReadAsStringAsync();
-
-                if (newIP == recordIPv6)
-                {
-                    UpdateStatsLabel(MODE_IPV6, "IP Not Changed");
-                }
-                else if (newIP.Length > 0)
-                {
-                    string[] arr = newIP.Split(':');
-                    if (arr.Length > 2)
+                    newIPv4 = await _httpClient.GetStringAsync(IpInfoUrl);
+                    if (newIPv4 != _currentIPv4)
                     {
-                        recordIPv6 = newIP.ToString();
-                        UpdateStatsLabel(MODE_IPV6, recordIPv6);
-                        isIPNotChanged = false;
+                        _currentIPv4 = newIPv4;
+                        needsUpdate = true;
+                        UpdateUI("IPv4", _currentIPv4, nowStr);
                     }
                     else
                     {
-                        UpdateStatsLabel(MODE_IPV6, "IP Not Detect");
+                        UpdateUI("IPv4", "IP Not Changed", nowStr);
                     }
                 }
-
-                if (isIPNotChanged == true)
+                catch
                 {
-                    //IP無變更，不需要更新
-                    return;
+                    UpdateUI("IPv4", "Detect Failed", nowStr);
                 }
 
-                StringBuilder apiURLBuilder = new StringBuilder("https://www.duckdns.org/update?");
-                apiURLBuilder.AppendFormat("domains={0}&token={1}&ip={2}&ipv6={3}", duckDNSData.domainName, duckDNSData.token, recordIPv4, recordIPv6);
-                string apiURL = apiURLBuilder.ToString();
-                HttpClient client = new HttpClient();
-                HttpResponseMessage rspn;
-                Uri uriWebApi = new Uri(apiURL);
-                rspn = await client.GetAsync(uriWebApi);
-                rspn.EnsureSuccessStatusCode();
+                // 2. 取得 IPv6
+                try
+                {
+                    string rawIPv6 = await _httpClient.GetStringAsync(Ip6InfoUrl);
+                    // 簡單驗證是否為 IPv6 格式 (包含冒號)
+                    if (!string.IsNullOrWhiteSpace(rawIPv6) && rawIPv6.Contains(":"))
+                    {
+                        newIPv6 = rawIPv6;
+                        if (newIPv6 != _currentIPv6)
+                        {
+                            _currentIPv6 = newIPv6;
+                            needsUpdate = true;
+                            UpdateUI("IPv6", _currentIPv6, nowStr);
+                        }
+                        else
+                        {
+                            UpdateUI("IPv6", "IP Not Changed", nowStr);
+                        }
+                    }
+                    else
+                    {
+                        UpdateUI("IPv6", "Not Detected", nowStr);
+                    }
+                }
+                catch
+                {
+                    UpdateUI("IPv6", "Detect Failed", nowStr);
+                }
 
-                UpdateStatsLabel(MODE_IPV4, "Success");
-                UpdateStatsLabel(MODE_IPV6, "Success");
+                // 3. 如果 IP 有變更，更新 DuckDNS
+                if (needsUpdate)
+                {
+                    var url = $"https://www.duckdns.org/update?domains={_duckDNSData.DomainName}&token={_duckDNSData.Token}&ip={_currentIPv4}&ipv6={_currentIPv6}";
 
+                    var response = await _httpClient.GetAsync(url);
+                    response.EnsureSuccessStatusCode();
+                    string result = await response.Content.ReadAsStringAsync();
+
+                    if (result == "OK")
+                    {
+                        UpdateUI("IPv4", $"Success ({_currentIPv4})", nowStr);
+                        UpdateUI("IPv6", $"Success ({_currentIPv6})", nowStr);
+                    }
+                    else
+                    {
+                        UpdateUI("IPv4", $"DuckDNS Error: {result}", nowStr);
+                    }
+                }
             }
             catch (Exception ex)
             {
-                string errorMsg = "";
-                if (ex.Message != null)
-                    errorMsg = ex.Message.Substring(0, Math.Min(ex.Message.Length, 40));
-                UpdateStatsLabel(MODE_IPV6, errorMsg);
-            }
-            finally
-            {
+                string errorMsg = ex.Message.Length > 40 ? ex.Message.Substring(0, 40) : ex.Message;
+                UpdateUI("Error", errorMsg, DateTime.Now.ToString());
             }
         }
 
-
-        private void UpdateStatsLabel(string mode, string info)
+        private void UpdateUI(string type, string info, string time)
         {
-            Dispatcher.BeginInvoke((Action)(() =>
+            // 確保在 UI 執行緒上執行
+            Dispatcher.Invoke(() =>
             {
-                if (mode == MODE_IPV4)
-                    Label_IPv4Status.Content = "IPv4: " + info + " " + Now;
-                else
-                    Label_IPv6Status.Content = "IPv6: " + info + " " + Now;
-            }));
+                if (type == "IPv4")
+                    Label_IPv4Status.Content = $"IPv4: {info} ({time})";
+                else if (type == "IPv6")
+                    Label_IPv6Status.Content = $"IPv6: {info} ({time})";
+                else if (type == "Error")
+                {
+                    // 可以選擇顯示在哪個 Label
+                    Label_IPv6Status.Content = $"Err: {info} ({time})";
+                }
+            });
         }
+
+        #region Data Persistence (Json)
 
         private void LoadRecord()
         {
-            if (File.Exists(recordFileName))
+            if (File.Exists(ConfigFileName))
             {
-                string rawString = File.ReadAllText(recordFileName);
-                duckDNSData.LoadDataFromString(rawString);
-                System.Console.WriteLine(rawString);
+                try
+                {
+                    string jsonString = File.ReadAllText(ConfigFileName);
+                    _duckDNSData = JsonSerializer.Deserialize<DNSData>(jsonString) ?? new DNSData();
+                }
+                catch
+                {
+                    _duckDNSData = new DNSData { UpdateInterval = "60" };
+                }
             }
             else
             {
-                duckDNSData.updateInterval = "60";
+                _duckDNSData.UpdateInterval = "60";
             }
 
-            TextBox_APIKey.Text = duckDNSData.token;
-            TextBox_ZoneID.Text = duckDNSData.domainName;
-            TextBox_Interval.Text = duckDNSData.updateInterval;
+            TextBox_APIKey.Text = _duckDNSData.Token;
+            TextBox_ZoneID.Text = _duckDNSData.DomainName;
+            TextBox_Interval.Text = _duckDNSData.UpdateInterval;
+        }
+
+        private void SaveRecord()
+        {
+            try
+            {
+                var options = new JsonSerializerOptions { WriteIndented = true };
+                string jsonString = JsonSerializer.Serialize(_duckDNSData, options);
+                File.WriteAllText(ConfigFileName, jsonString);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Save failed: {ex.Message}");
+            }
         }
 
         private void CheckAutoStart()
         {
-            if (duckDNSData.token != null && duckDNSData.token.Length > 0 &&
-                duckDNSData.domainName != null && duckDNSData.domainName.Length > 0 &&
-                duckDNSData.updateInterval != null && duckDNSData.updateInterval.Length > 0)
+            if (!string.IsNullOrEmpty(_duckDNSData.Token) &&
+                !string.IsNullOrEmpty(_duckDNSData.DomainName) &&
+                !string.IsNullOrEmpty(_duckDNSData.UpdateInterval))
             {
-
-                UpdateDomain();
-
+                // 使用非同步呼叫，不等待結果以避免卡住建構函式
+                _ = UpdateDNSInfoAsync();
                 StartTimer();
             }
         }
 
+        #endregion
 
-        private void SaveRecord()
-        {
-            if (File.Exists(recordFileName) == true)
-                File.Delete(recordFileName);
-            File.WriteAllText(recordFileName, duckDNSData.StringForWrite());
-        }
-
-        #region TrayIcon
+        #region TrayIcon & System
 
         private void InitTrayIcon()
         {
-            m_notifyIcon = new System.Windows.Forms.NotifyIcon();
-            m_notifyIcon.Text = "DuckDNSClient";
-            m_notifyIcon.Icon = Properties.Resources.godaddy;
-            m_notifyIcon.MouseDoubleClick += mNotifyIcon_MouseDoubleClick;
-            m_notifyIcon.MouseClick += mNotifyIcon_MouseClick;
-            m_notifyIcon.Visible = true;
-
-            mContextMenu = new System.Windows.Controls.ContextMenu();
-            MenuItem itemMainWindowShow = new MenuItem();
-            itemMainWindowShow.Header = "Setting";
-            itemMainWindowShow.Click += new RoutedEventHandler(MainWindow_Show_Click);
-            mContextMenu.Items.Add(itemMainWindowShow);
-            MenuItem itemExit = new MenuItem();
-            itemExit.Header = "Exit";
-            itemExit.Click += new RoutedEventHandler(Exit_Click);
-            mContextMenu.Items.Add(itemExit);
-        }
-        private void mNotifyIcon_MouseClick(object iSender, System.Windows.Forms.MouseEventArgs iEventArgs)
-        {
-            System.Windows.Forms.MouseEventArgs me = (System.Windows.Forms.MouseEventArgs)iEventArgs;
-            if (iEventArgs.Button == System.Windows.Forms.MouseButtons.Right)
+            _notifyIcon = new System.Windows.Forms.NotifyIcon
             {
-                mContextMenu.IsOpen = true;
-            }
+                Text = "DuckDNSClient",
+                Icon = Properties.Resources.godaddy, // 確保 Resources 中有此圖示
+                Visible = true
+            };
+
+            _notifyIcon.MouseDoubleClick += (s, e) => { this.Show(); this.WindowState = WindowState.Normal; };
+            _notifyIcon.MouseClick += (s, e) =>
+            {
+                if (e.Button == System.Windows.Forms.MouseButtons.Right) _contextMenu.IsOpen = true;
+            };
+
+            _contextMenu = new ContextMenu();
+
+            MenuItem itemShow = new MenuItem { Header = "Setting" };
+            itemShow.Click += (s, e) => { this.Show(); this.WindowState = WindowState.Normal; };
+
+            MenuItem itemExit = new MenuItem { Header = "Exit" };
+            itemExit.Click += Exit_Click;
+
+            _contextMenu.Items.Add(itemShow);
+            _contextMenu.Items.Add(itemExit);
         }
-        private void MainWindow_Show_Click(object sender, RoutedEventArgs e)
-        {
-            this.Show();
-        }
-        private void mNotifyIcon_MouseDoubleClick(object iSender, System.Windows.Forms.MouseEventArgs iEventArgs)
-        {
-            mContextMenu.IsOpen = false;
-        }
+
         private void Exit_Click(object sender, RoutedEventArgs e)
         {
+            _notifyIcon.Visible = false;
+            _notifyIcon.Dispose();
             Application.Current.Shutdown();
         }
+
         protected override void OnStateChanged(EventArgs e)
         {
             if (WindowState == WindowState.Minimized) this.Hide();
             base.OnStateChanged(e);
         }
-        // Minimize to system tray when application is closed.
+
         protected override void OnClosing(CancelEventArgs e)
         {
-            // setting cancel to true will cancel the close request
-            // so the application is not closed
             e.Cancel = true;
             this.Hide();
             base.OnClosing(e);
         }
 
         #endregion
-
     }
 
-
+    // 使用屬性 (Properties) 配合 JSON 序列化
     public class DNSData
     {
-        public string token;
-        public string domainName;
-        public string updateInterval;
-        public bool enableIPv6;
-
-        private char _splitToken = ',';
-        private int tokenIndex = 0;
-        private int domainNameIndex = 1;
-        private int updateIntervalIndex = 2;
-        public string StringForWrite()
-        {
-            System.Text.StringBuilder stringToWrite = new System.Text.StringBuilder();
-            stringToWrite.Append(token);
-            stringToWrite.Append(_splitToken);
-            stringToWrite.Append(domainName);
-            stringToWrite.Append(_splitToken);
-            stringToWrite.Append(updateInterval);
-            return stringToWrite.ToString();
-        }
-
-        public void LoadDataFromString(string input)
-        {
-            string[] datas = input.Split(_splitToken);
-            token = datas[tokenIndex];
-            domainName = datas[domainNameIndex];
-            updateInterval = datas[updateIntervalIndex];
-            if (Int32.Parse(updateInterval) > 35790)
-                updateInterval = "35790";
-
-        }
+        public string Token { get; set; } = "";
+        public string DomainName { get; set; } = "";
+        public string UpdateInterval { get; set; } = "60";
+        public bool EnableIPv6 { get; set; } = true;
     }
 }
+
